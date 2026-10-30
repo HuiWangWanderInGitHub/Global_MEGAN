@@ -66,6 +66,10 @@ subroutine megan_voc(yyyy,ddd,hh,                         & !year,julian day,hou
     real   :: TotalCT
     real   :: month,day,hour
     real   :: SinZenith, Zenith!Sinbeta, Beta
+    real, parameter :: RAD = 57.29578
+    real :: elev_deg, elev_rad
+    real :: sin_elev, sin25
+
     real   :: Solar, Maxsolar,Eccentricity,    &
          Difffrac, PPFDfrac, QbAbsn,           &
          Trate, Qbeamv,Qdiffv, Qbeamn, Qdiffn, &
@@ -166,8 +170,21 @@ subroutine megan_voc(yyyy,ddd,hh,                         & !year,julian day,hou
            Solar    = rad(i,j)/2.25  !solar radiation   [W m-2]                (from meteo)
 
            !(1) calc solar angle
-           zenith      = CalcZenith(day,lat(j),hour)
-           SinZenith   = max(sin(25/57.29578), sin(zenith / 57.29578)) !57.29578=rad2deg
+           !zenith      = CalcZenith(day,lat(j),hour)
+           !SinZenith   = max(sin(25/57.29578), sin(zenith / 57.29578)) !57.29578=rad2deg
+           ! solar elevation angle (deg)
+           elev_deg = CalcZenith(day, lat(j), hour)
+           elev_rad = elev_deg / RAD
+           
+           sin_elev = sin(elev_rad)
+           sin25    = sin(25.0 / RAD)
+           
+           ! night = 0, daytime apply 25-degree lower bound
+           if (sin_elev <= 0.0) then
+               SinZenith = 0.0
+           else
+               SinZenith = max(sin25, sin_elev)
+           end if           
            Eccentricity= CalcEccentricity(Day)
            Maxsolar    = SinZenith * SolarConstant * Eccentricity
 
