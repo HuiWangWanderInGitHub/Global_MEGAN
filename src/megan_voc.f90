@@ -66,7 +66,7 @@ subroutine megan_voc(yyyy,ddd,hh,                         & !year,julian day,hou
     real   :: TotalCT
     real   :: month,day,hour
     real   :: SinZenith, Zenith!Sinbeta, Beta
-    real, parameter :: RAD = 57.29578
+    real, parameter :: degrees_per_radian = 57.29578
     real :: elev_deg, elev_rad
     real :: sin_elev, sin25
 
@@ -174,10 +174,10 @@ subroutine megan_voc(yyyy,ddd,hh,                         & !year,julian day,hou
            !SinZenith   = max(sin(25/57.29578), sin(zenith / 57.29578)) !57.29578=rad2deg
            ! solar elevation angle (deg)
            elev_deg = CalcZenith(day, lat(j), hour)
-           elev_rad = elev_deg / RAD
+           elev_rad = elev_deg / degrees_per_radian
            
            sin_elev = sin(elev_rad)
-           sin25    = sin(25.0 / RAD)
+           sin25    = sin(25.0 / degrees_per_radian)
            
            ! night = 0, daytime apply 25-degree lower bound
            if (sin_elev <= 0.0) then
@@ -1180,3 +1180,4 @@ end function  SvdTk
 end subroutine megan_voc
 
 end module voc_mod
+

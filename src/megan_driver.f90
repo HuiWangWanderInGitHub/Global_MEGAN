@@ -8,6 +8,8 @@ program main
    use datetime_module, only: datetime, timedelta, strptime!, secondsSinceEpoch
    use voc_mod   !megan module: (megan_voc)
    use co2_reader
+   use, intrinsic :: iso_fortran_env, only: real64, int16
+   use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
    !use nox_mod   !megan module: (megan_nox)
    !use bdsnp    !megan module: (bdsnp_nox)
    
@@ -26,8 +28,8 @@ program main
    character(3) ::  ddd,current_jday                            
    character(2) ::   mm,dd,hh,current_day="99",current_month="99"
    character(len=19) :: current_date
-   character(len=10) :: cur_format_date
-   type(datetime)    :: current_date_s, end_date_s
+   type(datetime)    :: current_date_s, end_date_s, next_date_s
+   type(datetime)    :: output_start_s, output_month_s
    integer(kind=8)   :: cur_sec_epoch
 
    !input variables:
@@ -60,7 +62,11 @@ program main
 
    !output vars:
    real, allocatable, dimension(:,:,:)   :: out_buffer
-   real, allocatable, dimension(:,:,:,:) :: out_buffer_all,out_buffer_emis   !(x,y,nclass,t)
+   real, allocatable, dimension(:,:,:,:) :: out_buffer_emis   !(x,y,1,nclass)
+   real(real64), allocatable :: output_sum(:,:,:)
+   integer, allocatable :: output_count(:,:,:)
+   integer :: output_hours, output_samples=0, output_record=0
+   character(len=7) :: output_month=''
 
    !megan namelist variables:
    character(len=19) :: start_date, end_date
@@ -71,6 +77,7 @@ program main
    character(256)    :: pft_file_path !path to pft file
    character(256)    :: ef_file_path  !path to ef file
    character(256)    :: output_path   !path to output file
+   character(len=16) :: output_frequency='24h' !1h, 3h, 6h, 24h or monthly
    
 
    character(256)    :: met_files     !global meteo files
@@ -102,7 +109,7 @@ program main
    !---read namelist variables and parameters
    namelist/megan_nl/start_date,end_date,&
                      met_file_path,lai_file_path,pft_file_path,&
-                     ef_file_path,output_path,&
+                     ef_file_path,output_path,output_frequency,&
                      met_files, pft_files, ef_file, lai_files,&
                      nlai,lai_scale_factor,run_co2,co2_file,&
                      run_flower, run_litter,real_spinup_met,output_ef_file,output_gamma,diagnose
@@ -135,6 +142,20 @@ program main
    if( iostat /= 0 ) then
      call safe_mpi_exit("megan: failed to read namelist",iostat)
    end if
+   call parse_output_frequency(output_frequency, output_hours)
+   current_date_s = strptime(start_date,'%Y-%m-%d %H:%M:%S')
+   end_date_s = strptime(end_date,'%Y-%m-%d %H:%M:%S')
+   if (.not. current_date_s%isValid() .or. .not. end_date_s%isValid()) then
+      call safe_mpi_exit('megan: invalid start_date or end_date', 1)
+   end if
+   if (end_date_s < current_date_s) then
+      call safe_mpi_exit('megan: end_date precedes start_date', 1)
+   end if
+   if (current_date_s%getMinute() /= 0 .or. current_date_s%getSecond() /= 0 .or. &
+       end_date_s%getMinute() /= 0 .or. end_date_s%getSecond() /= 0) then
+      call safe_mpi_exit('megan: start_date and end_date must be on whole hours', 1)
+   end if
+   print '(A,A)', ' Output averaging frequency: ', trim(output_frequency)
    !prepare variables
    lai_num = atoi(nlai)
    
@@ -159,6 +180,9 @@ program main
    call MPI_Bcast(pmet_file,    len(pmet_file),  MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
    call MPI_Bcast(start_date,   len(start_date), MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
    call MPI_Bcast(end_date,     len(end_date),   MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
+   call MPI_Bcast(output_path, len(output_path), MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
+   call MPI_Bcast(output_frequency, len(output_frequency), MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
+   call MPI_Bcast(output_hours, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
    call MPI_Bcast(nlon,    1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
    call MPI_Bcast(nlat,    1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)   
    call MPI_Bcast(lai_num, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)   
@@ -193,8 +217,9 @@ program main
    call get_times_parallel(met_file,times)
    !--- Allocate variables
    allocate(lon_local(ilen))
-   allocate(out_buffer_emis(ilen,nlat,24,nclass))
+   allocate(out_buffer_emis(ilen,nlat,1,nclass))
    allocate(out_buffer(ilen,nlat,nclass))
+   allocate(output_sum(ilen,nlat,nclass), output_count(ilen,nlat,nclass))
    allocate( temp(ilen, nlat))
    allocate(dtemp(ilen, nlat))
    allocate(  u10(ilen, nlat))
@@ -225,6 +250,8 @@ program main
    allocate(ldf_in(ilen,nlat,4))
  
    out_buffer_emis=0.0
+   output_sum=0.0_real64
+   output_count=0
    temp=0.0  ;dtemp=0.0 ;u10=0.0; v10=0.0
    wind=0.0  ;pres=0.0  ;ppfd=0.0;rh=0.0
    temp24=0.0;ppfd24=0.0;wind24=0.0
@@ -381,36 +408,17 @@ program main
              run_flower_flag,run_litter_flag,              &
              run_co2_flag, co2_value,diagnose_flag,FillValue                  ) 
 
-      if(diagnose_flag == 1)then
-         out_buffer_emis(:,:,t_24,:) = out_buffer
-      else
-         if(output_gamma_flag == 1)then 
-         out_buffer_emis(:,:,t_24,:) = out_buffer!*ef
-         else
-         out_buffer_emis(:,:,t_24,:) = out_buffer*ef
-         end if
+      ! Average emissions after applying EF; gamma and diagnostics are averaged directly.
+      if (diagnose_flag /= 1 .and. output_gamma_flag /= 1) then
+         where (out_buffer /= FillValue .and. ef /= FillValue)
+            out_buffer = out_buffer * ef
+         elsewhere
+            out_buffer = FillValue
+         end where
       end if
-      !==========test=================
-      !out_buffer_emis(:,:,t_24,1) = temp
-      !out_buffer_emis(:,:,t_24,2) = temp24_avg
-      !out_buffer_emis(:,:,t_24,3) = temp240_avg
-      !out_buffer_emis(:,:,t_24,4) = ppfd
-      !out_buffer_emis(:,:,t_24,5) = ppfd24_avg
-      !out_buffer_emis(:,:,t_24,6) = ppfd240_avg
-      !out_buffer_emis(:,:,t_24,7) = wind
-      !out_buffer_emis(:,:,t_24,8) = lai(:,:,laip_idx)
-      !out_buffer_emis(:,:,t_24,9) = lai(:,:,laic_idx)
-      !out_buffer_emis(:,:,t_24,10) = out_buffer(:,:,1)
-      !out_buffer_emis(:,:,t_24,11) = out_buffer(:,:,3)
-      !out_buffer_emis(:,:,t_24,12) = out_buffer(:,:,4)
-      !out_buffer_emis(:,:,t_24,13) = ef(:,:,1)
-      !out_buffer_emis(:,:,t_24,14) = ef(:,:,3)
-      !out_buffer_emis(:,:,t_24,15) = ctf(:,:,3)
-      !out_buffer_emis(:,:,t_24,16) = ctf(:,:,4)
-      !out_buffer_emis(:,:,t_24,17) = ctf(:,:,5)
-      !out_buffer_emis(:,:,t_24,18) = ldf_in(:,:,1)
-      !out_buffer_emis(:,:,t_24,19) = ldf_in(:,:,2)
-      !===============================
+      if (output_samples == 0) output_start_s = current_date_s
+      call accumulate_output(out_buffer, output_sum, output_count)
+      output_samples = output_samples + 1
       call get_averaged_data(rank,nlat,ilen,t_total,&
                                 temp24,ppfd24,wind24,&
                                 temp240,ppfd240,&
@@ -432,29 +440,46 @@ program main
       !endif
       
 
-      !if ( hh .eq. '23' )then
-      if ( hh .eq. '23' )then
-         !write MEGAN group output file
-         out_file = trim(output_path)//"/"//"Global_emis_MEGAN_" // yyyy // "-" // mm // "-" // dd // ".nc"
-         if (rank .eq. 0)then
-         cur_format_date = yyyy // "-" // mm // "-" // dd
-         call create_output_file(out_file,cur_format_date,nlat,nlon,lat,lon,output_gamma_flag,diagnose_flag)
-         end if 
+      next_date_s = current_date_s + timedelta(hours=1)
+      if (output_interval_complete(current_date_s, end_date_s, output_hours)) then
+         ! Flush at the interval boundary, month boundary, or final simulated hour.
+         ! A partial first/last interval contains only the hours actually simulated.
+         out_buffer_emis(:,:,1,:) = FillValue
+         where (output_count > 0)
+            out_buffer_emis(:,:,1,:) = real(output_sum / max(output_count, 1))
+         end where
+         if (output_month /= yyyy//'-'//mm) then
+            output_month = yyyy//'-'//mm
+            output_month_s = datetime(atoi(yyyy), atoi(mm), 1)
+            output_record = 0
+            out_file = trim(output_path)//'/Global_emis_MEGAN_'//output_month//'.nc'
+            if (rank == 0) then
+               call create_output_file(out_file,output_month//'-01',nlat,nlon,lat,lon,&
+                                       output_gamma_flag,diagnose_flag,output_frequency)
+            end if
+         end if
+         output_record = output_record + 1
+         if (rank == 0) then
+            call write_output_time(out_file, output_record, output_start_s, next_date_s, &
+                                   output_month_s, output_samples)
+         end if
          do k = 1, nclass
          if( diagnose_flag .eq. 1)then
          call gather_output_3d(out_file,trim(mgn_diag_var(k)),out_buffer_emis(:,:,:,k),&
-                            ilen,  nlat, 24, &
-                            nlon, rank, nprocs,0)
+                            ilen,  nlat, 1, &
+                            nlon, rank, nprocs,0,output_record)
          else
          call gather_output_3d(out_file,trim(mgn_spc(k)),out_buffer_emis(:,:,:,k),&
-                            ilen,  nlat, 24, &
-                            nlon, rank, nprocs,output_gamma_flag)
+                            ilen,  nlat, 1, &
+                            nlon, rank, nprocs,output_gamma_flag,output_record)
          end if
          end do 
-         out_buffer_emis=0.0
+         output_sum = 0.0_real64
+         output_count = 0
+         output_samples = 0
       endif    
 
-      current_date_s  = current_date_s + timedelta(hours=1)
+      current_date_s = next_date_s
       !Define next expected date
       current_date=current_date_s%strftime("%Y %m %d %j %H")
       read(current_date ,*) yyyy,mm,dd,ddd,hh                !
@@ -475,6 +500,8 @@ program main
    
    if (allocated(out_buffer_emis)) deallocate(out_buffer_emis)
    if (allocated(out_buffer)) deallocate(out_buffer)
+   if (allocated(output_sum)) deallocate(output_sum)
+   if (allocated(output_count)) deallocate(output_count)
    if (allocated(temp)) deallocate( temp)
    if (allocated(dtemp))deallocate(dtemp)
    if (allocated(u10))  deallocate(  u10)
@@ -1299,8 +1326,8 @@ contains
      real,    allocatable :: vcf(:,:)
     
     
-     var_ef  = (/"SHRUB_EF","GRASS_EF","CROP_EF","TREE_EF"/) 
-     var_ldf = (/"SHRUB_LDF","GRASS_LDF","CROP_LDF","TREE_LDF"/) 
+     var_ef  = [character(len=8) :: "SHRUB_EF","GRASS_EF","CROP_EF","TREE_EF"]
+     var_ldf = [character(len=9) :: "SHRUB_LDF","GRASS_LDF","CROP_LDF","TREE_LDF"]
      
 
      if(.not. allocated (data_local))   allocate( data_local(ilen, nlat))
@@ -1543,19 +1570,89 @@ contains
    end subroutine create_output_ef_file
 
    !OUTPUT ----------------------------------------------------------------
+   subroutine parse_output_frequency(frequency, hours)
+      character(len=*), intent(inout) :: frequency
+      integer, intent(out) :: hours
+      integer :: i, code
+
+      frequency = adjustl(frequency)
+      do i = 1, len_trim(frequency)
+         code = iachar(frequency(i:i))
+         if (code >= iachar('A') .and. code <= iachar('Z')) frequency(i:i) = achar(code + 32)
+      end do
+      select case (trim(frequency))
+      case ('1h')
+         hours = 1
+      case ('3h')
+         hours = 3
+      case ('6h')
+         hours = 6
+      case ('24h')
+         hours = 24
+      case ('monthly')
+         hours = 0
+      case default
+         call safe_mpi_exit('megan: output_frequency must be 1h, 3h, 6h, 24h or monthly', 1)
+      end select
+   end subroutine parse_output_frequency
+
+   logical function output_interval_complete(current, last, hours) result(complete)
+      type(datetime), intent(in) :: current, last
+      integer, intent(in) :: hours
+      type(datetime) :: next
+
+      next = current + timedelta(hours=1)
+      complete = next > last .or. next%getMonth() /= current%getMonth() .or. &
+                 next%getYear() /= current%getYear()
+      ! Fixed-hour windows are aligned to midnight UTC, independently of start_date.
+      if (hours > 0) complete = complete .or. mod(next%getHour(), hours) == 0
+   end function output_interval_complete
+
+   subroutine accumulate_output(values, sums, counts)
+      real, intent(in) :: values(:,:,:)
+      real(real64), intent(inout) :: sums(:,:,:)
+      integer, intent(inout) :: counts(:,:,:)
+
+      ! Do not average fill values or non-finite values into valid grid cells.
+      where (values /= FillValue .and. ieee_is_finite(values))
+         sums = sums + real(values, real64)
+         counts = counts + 1
+      end where
+   end subroutine accumulate_output
+
+   subroutine write_output_time(out_file, record, first, next, origin, samples)
+      character(len=*), intent(in) :: out_file
+      integer, intent(in) :: record, samples
+      type(datetime), intent(in) :: first, next, origin
+      real(real64) :: bounds(2,1)
+      integer :: ncid, varid
+
+      bounds(1,1) = real(first%secondsSinceEpoch() - origin%secondsSinceEpoch(), real64)
+      bounds(2,1) = real(next%secondsSinceEpoch() - origin%secondsSinceEpoch(), real64)
+      call check(nf90_open(trim(out_file), nf90_write, ncid))
+      call check(nf90_inq_varid(ncid, 'time', varid))
+      call check(nf90_put_var(ncid, varid, [sum(bounds(:,1))/2.0_real64], start=[record], count=[1]))
+      call check(nf90_inq_varid(ncid, 'time_bnds', varid))
+      call check(nf90_put_var(ncid, varid, bounds, start=[1,record], count=[2,1]))
+      call check(nf90_inq_varid(ncid, 'sample_count', varid))
+      call check(nf90_put_var(ncid, varid, [samples], start=[record], count=[1]))
+      call check(nf90_close(ncid))
+   end subroutine write_output_time
+
    subroutine create_output_file(out_file,current_date,&
                                  nlat,nlon,lat,lon,&
                                  output_gamma_flag,&
-                                 diagnose_flag)
+                                 diagnose_flag,frequency)
      implicit none
      character(len=*), intent(in) :: out_file
      character(len=*), intent(in) :: current_date
+     character(len=*), intent(in) :: frequency
      integer,          intent(in) :: nlat, nlon
      real, allocatable,intent(in) :: lat(:),lon(:)
      integer,          intent(in) :: output_gamma_flag,diagnose_flag
    
-     integer :: ncid, t_dim_id, x_dim_id, y_dim_id, str_dim_id
-     integer :: var_id_lat, var_id_lon, var_id_area, var_id_time, k, t
+     integer :: ncid, t_dim_id, x_dim_id, y_dim_id, b_dim_id
+     integer :: var_id_lat, var_id_lon, var_id_time, var_id_bounds, var_id_samples, k
      integer, allocatable :: var_id_mech(:)
    
      allocate(var_id_mech(nclass))
@@ -1566,8 +1663,8 @@ contains
      !call check(nf90_create(trim(out_file), nf90_clobber, ncid))
      call check(nf90_create(trim(out_file), IOR(nf90_clobber, nf90_netcdf4), ncid))
  
-     call check(nf90_def_dim(ncid, "datestrlen", 19, str_dim_id))
-     call check(nf90_def_dim(ncid, "time",       24, t_dim_id))
+     call check(nf90_def_dim(ncid, "time", nf90_unlimited, t_dim_id))
+     call check(nf90_def_dim(ncid, "nv",          2, b_dim_id))
      call check(nf90_def_dim(ncid, "lon",      nlon, x_dim_id))
      call check(nf90_def_dim(ncid, "lat",      nlat, y_dim_id))
    
@@ -1581,13 +1678,21 @@ contains
      call check(nf90_put_att(ncid, var_id_lon, "long_name", "longitude"))
    
    
-     call check(nf90_def_var(ncid, "time", nf90_int, [t_dim_id], var_id_time))
+     call check(nf90_put_att(ncid, nf90_global, 'output_frequency', trim(frequency)))
+     call check(nf90_put_att(ncid, nf90_global, 'averaging', &
+                'Mean of valid hourly samples; partial intervals use only simulated hours.'))
+     call check(nf90_def_var(ncid, "time", nf90_double, [t_dim_id], var_id_time))
      call check(nf90_put_att(ncid, var_id_time, "units", &
                 "seconds since "//current_date//" 00:00:00 utc"))
-     call check(nf90_put_att(ncid, var_id_time, "long_name", "time"))
-     call check(nf90_put_att(ncid, var_id_time, "axis", "t"))
+     call check(nf90_put_att(ncid, var_id_time, "long_name", "midpoint of averaging interval"))
+     call check(nf90_put_att(ncid, var_id_time, "axis", "T"))
      call check(nf90_put_att(ncid, var_id_time, "calendar", "standard"))
      call check(nf90_put_att(ncid, var_id_time, "standard_name", "time"))
+     call check(nf90_put_att(ncid, var_id_time, 'bounds', 'time_bnds'))
+     call check(nf90_def_var(ncid, 'time_bnds', nf90_double, [b_dim_id,t_dim_id], var_id_bounds))
+     call check(nf90_def_var(ncid, 'sample_count', nf90_int, [t_dim_id], var_id_samples))
+     call check(nf90_put_att(ncid, var_id_samples, 'long_name', 'number of simulated hourly samples in interval'))
+     call check(nf90_put_att(ncid, var_id_samples, 'units', '1'))
    
      do k = 1, nclass
        if(diagnose_flag == 1)then
@@ -1603,7 +1708,8 @@ contains
                                   [x_dim_id, y_dim_id, t_dim_id], var_id_mech(k)))
           call check(nf90_put_att(ncid, var_id_mech(k), "units", "unit_less"))
           call check(nf90_put_att(ncid, var_id_mech(k), "scale_factor", 0.01))
-          call check(nf90_put_att(ncid, var_id_mech(k), "missing_value", 0))
+          call check(nf90_put_att(ncid, var_id_mech(k), "_FillValue", int(nf90_fill_short, int16)))
+          call check(nf90_put_att(ncid, var_id_mech(k), "missing_value", int(nf90_fill_short, int16)))
           call check(nf90_put_att(ncid, var_id_mech(k), "var_desc", &
                                   trim(mgn_spc(k))//" gamma value"))
           else
@@ -1616,6 +1722,7 @@ contains
                                   trim(mgn_spc(k))//" emission rate"))
           end if
        end if
+       call check(nf90_put_att(ncid, var_id_mech(k), 'cell_methods', 'time: mean'))
      end do
    
      call check(nf90_enddef(ncid))
@@ -1623,7 +1730,6 @@ contains
      ! write data directly (no reopening)
      call check(nf90_put_var(ncid, var_id_lat,  lat))
      call check(nf90_put_var(ncid, var_id_lon,  lon))
-     call check(nf90_put_var(ncid, var_id_time, [(3600*(k-1), k=1,24)]))
    
      call check(nf90_close(ncid))
    
@@ -1704,7 +1810,7 @@ contains
 !==========================================================
    subroutine gather_output_3d(out_file,var_name,temp_in,&
                             ilen, nlat, nt, &
-                            nlon_total, rank, nprocs, output_gamma_flag)
+                            nlon_total, rank, nprocs, output_gamma_flag, record)
       implicit none
 
       character(len=*), intent(in) :: out_file
@@ -1713,7 +1819,7 @@ contains
       integer,          intent(in) :: ilen!, istart
       integer,          intent(in) :: nlat, nt, nlon_total
       integer,          intent(in) :: rank, nprocs
-      integer,          intent(in) :: output_gamma_flag 
+      integer,          intent(in) :: output_gamma_flag, record
 
       ! gather buffers
       real,    allocatable :: sendbuf(:), recvbuf(:), temp_global(:,:,:)
@@ -1791,16 +1897,19 @@ contains
         end do
         if(output_gamma_flag == 1)then
         if(.not. allocated(temp_global_int)) allocate(temp_global_int(nlon_total,nlat,nt))
-        temp_global_int = int(temp_global*100., kind=2) 
+        temp_global_int = int(nf90_fill_short, int16)
+        where (temp_global /= FillValue .and. ieee_is_finite(temp_global))
+           temp_global_int = int(temp_global*100., kind=int16)
+        end where
         call check(nf90_open(trim(out_file), nf90_write, ncid ))
         call check(nf90_inq_varid(ncid,var_name//"_GAMMA",varid))
-        call check(nf90_put_var(ncid, varid, temp_global_int, start=[1, 1, 1], count=[nlon_total, nlat, nt]))
+        call check(nf90_put_var(ncid, varid, temp_global_int, start=[1, 1, record], count=[nlon_total, nlat, nt]))
         call check(nf90_close(ncid))
         deallocate(temp_global_int)
         else
         call check(nf90_open(trim(out_file), nf90_write, ncid ))
         call check(nf90_inq_varid(ncid,var_name,varid))
-        call check(nf90_put_var(ncid, varid, temp_global, start=[1, 1, 1], count=[nlon_total, nlat, nt]))
+        call check(nf90_put_var(ncid, varid, temp_global, start=[1, 1, record], count=[nlon_total, nlat, nt]))
         call check(nf90_close(ncid))
         end if
         deallocate(    recvbuf)
@@ -1948,3 +2057,4 @@ contains
    end subroutine safe_mpi_exit
    
 end program main
+
