@@ -1,6 +1,7 @@
 &megan_nl
   start_date='__START__',   ! YYYY-MM-DD HH:MM:SS
   end_date  ='__END__',   ! YYYY-MM-DD HH:MM:SS
+  output_frequency = '24h', ! Mean over 1h, 3h, 6h, 24h or monthly; one file per month
 
   met_file_path = '/glade/campaign/univ/ucir0060/ERA5_land/unzip_era5land_2000-2020'
   lai_file_path = '/glade/campaign/univ/ucir0060/LAI4g_Regridded_0.1deg'
@@ -25,3 +26,4 @@
   output_gamma = .true.
   diagnose = .false.
 /
+
