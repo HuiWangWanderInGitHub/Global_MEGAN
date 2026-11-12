@@ -456,7 +456,6 @@ contains
         IF (PPFD24 < 0.01) THEN
             GAMP= 0.0
         ELSE
-            !Alpha  = 0.004
             !-0.0005*log(ppfd240)
             !C1 = 0.0374 * EXP(0.0005 * (PPFD24 - 240)) * (PPFD240** 0.6)
             !if(light_shd == 1)then
@@ -464,11 +463,14 @@ contains
             !else
             !C1 = 0.0468 * EXP(0.0005 * (PPFD24 - 50)) * (PPFD240** 0.6)
             !end if
-            !C1 = 1.03
             !Alpha  = 0.004 - 0.0005*log(ppfd24/2.)
             !C1 = 0.048 * EXP(0.0005 * (PPFD24/2. - 240))*((PPFD24/2.)**0.6)
-            Alpha  = 0.004 - 0.0003*log(ppfd24/2.)
-            C1 = 0.0468 * EXP(0.0005 * (PPFD24/2. - 200))*((PPFD24/2.)**0.6)
+            !Alpha  = 0.004 - 0.0003*log(ppfd24/2.)
+            !C1 = 0.0468 * EXP(0.0005 * (PPFD24/2. - 200))*((PPFD24/2.)**0.6)
+            !Alpha  = 0.004 - 0.0003*log(ppfd24/2.)
+            !C1 = 0.0468 * EXP(0.0005 * (PPFD24/2. - 200))*((PPFD24/2.)**0.6)
+            Alpha  = 0.004
+            C1 = 1.03
                
             GAMP= (Alpha * C1 * PPFD1) / SQRT(1.0 + Alpha**2 * PPFD1**2)
         ENDIF
@@ -912,6 +914,8 @@ SUBROUTINE CanopyEB(Trate, Layers, Distgauss, Canopychar,            &
       REAL :: Cdepth, Lwidth, Llength, Cheight, Eps, TranspireType, Deltah, EmissAtm, IRin,IRout !LeafIR, 
 !     &         Deltah, UnexposedLeafIRin, ExposedLeafIRin, IRin,IRout
       REAL,DIMENSION(Layers) :: Ldepth, Wsh
+      REAL :: topWind, minimumWind, noWindDepth, attenuation
+      REAL :: EmissTop
 
       Cdepth        = Canopychar(1, Cantype)
       Lwidth        = Canopychar(2, Cantype)
@@ -935,8 +939,14 @@ SUBROUTINE CanopyEB(Trate, Layers, Distgauss, Canopychar,            &
       HumidairPa(:) = HumidairPa0  + (Deltah * Ldepth(:))
 
       Wsh(:) = (Cheight-Ldepth(:)) - (Canopychar(16,Cantype) * Cheight)
-      Ws(:)  = (Ws0*LOG(Wsh(:))/LOG(Cheight-Canopychar(16,Cantype) * Cheight))
-      WHERE (Wsh(:) < 0.001) Ws(:) = 0.05
+      ! Exponential canopy wind profile, matching megan3.3/main.
+      topWind     = max(Ws0, 0.001)
+      minimumWind = min(0.05, topWind)
+      noWindDepth = max(Canopychar(16,Cantype), 1.0e-6)
+      attenuation = -log(0.05) / noWindDepth
+
+      Ws(:) = minimumWind + (topWind-minimumWind) * &
+        exp(-attenuation*Distgauss(:))
 
       DO i=1,Layers
 
@@ -946,14 +956,16 @@ SUBROUTINE CanopyEB(Trate, Layers, Distgauss, Canopychar,            &
          !        ShadeleafIR(i) = 2 * IRin
          !        SunleafIR(i) = 0.5*ExposedLeafIRin(HumidairPa0,TairK0)+1.5*IRin
          
-         ! Apparent atmospheric emissivity for clear skies: 
-         ! function of water vapor pressure (Pa) 
-         ! and ambient Temperature (K) based on Brutsaert(1975) 
-         ! referenced in Leuning (1997)
-         EmissAtm        = 0.642 * (HumidairPa(i) / TairK(i))**(1./7.)   
+         ! Clear-sky atmospheric emissivity: Idso (1981),
+         ! matching megan3.3/main; convert vapor pressure from Pa to kPa.
+         EmissAtm        = 0.7 + 5.95 * (HumidairPa(i)/1000.0) * &
+                          1.0e-4 * exp(1500.0/TairK(i))
          IRin            = LeafIR (TairK(i), EmissAtm)
          ShadeleafIR(i)  = IRin
-         SunleafIR(i)    = IRin
+         ! Sunlit leaves also receive the canopy-top longwave contribution.
+         EmissTop = 0.7 + 5.95 * (HumidairPa0/1000.0) * &
+                          1.0e-4 * exp(1500.0/TairK0)
+         SunleafIR(i)    = 0.75*IRin + 0.5*EmissTop*Sb*TairK0**4
 
       ! Sun
         CALL LeafEB(SunPPFD(i), SunQv(i) + SunQn(i),                    &
@@ -1004,7 +1016,7 @@ SUBROUTINE LeafEB(PPFD, Q, IRin, Eps, TranspireType,         &
 
       ! Heat convection coefficient (W m-2 K-1) for forced convection. 
       ! Nobel page 366
-      GHforced = 0.0259 / (0.004 * ((Llength / Ws)**0.5))
+      GHforced = 0.0259 / (0.004 * sqrt(Lwidth / Ws1))
 
       ! Stomatal resistence s m-1
       StomRes  = ResSC(PPFD)
